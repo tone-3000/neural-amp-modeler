@@ -11,6 +11,7 @@ For the base *PyTorch* model containing the actual architecture, see `..models.b
 """
 
 import logging as _logging
+import math as _math
 from dataclasses import dataclass as _dataclass
 from enum import Enum as _Enum
 from typing import Any as _Any
@@ -178,6 +179,25 @@ class _LossItem(_NamedTuple):
     value: _Optional[_torch.Tensor]
 
 
+def _input_perturbation_std_at_epoch(
+    start: float,
+    end: _Optional[float],
+    schedule: str,
+    epoch: int,
+    max_epochs: int,
+) -> float:
+    if end is None:
+        return start
+    if max_epochs <= 1:
+        return float(end)
+    t = min(1.0, float(epoch) / float(max_epochs - 1))
+    if schedule == "linear":
+        return float(start + (end - start) * t)
+    if schedule == "cosine":
+        return float(end + (start - end) * 0.5 * (1.0 + _math.cos(_math.pi * t)))
+    raise ValueError(f"Unknown input_perturbation schedule: {schedule!r}")
+
+
 class LightningModule(_pl.LightningModule, _InitializableFromConfig):
     """
     The PyTorch Lightning Module that unites the model with its loss and
@@ -190,6 +210,9 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         optimizer_config: _Optional[dict] = None,
         scheduler_config: _Optional[dict] = None,
         loss_config: _Optional[LossConfig] = None,
+        input_perturbation_std: _Optional[float] = None,
+        input_perturbation_std_end: _Optional[float] = None,
+        input_perturbation_schedule: str = "linear",
     ):
         """
         :param scheduler_config: contains
@@ -211,6 +234,10 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         # Keeping it on-device is preferable, but if that fails, then remember to drop
         # it to cpu from then on.
         self._mrstft_device: _Optional[_torch.device] = None
+
+        self._input_perturbation_std = input_perturbation_std
+        self._input_perturbation_std_end = input_perturbation_std_end
+        self._input_perturbation_schedule = input_perturbation_schedule
 
     @classmethod
     def init_from_config(cls, config):
@@ -258,12 +285,19 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
             name=net_config["name"], kwargs={"config": net_config["config"]}
         )
         loss_config = LossConfig.init_from_config(config.get("loss", {}))
-        return {
+
+        ip = config.get("input_perturbation") or {}
+        result = {
             "net": net,
             "optimizer_config": config["optimizer"],
             "scheduler_config": config["lr_scheduler"],
             "loss_config": loss_config,
         }
+        if ip.get("std") is not None:
+            result["input_perturbation_std"] = ip["std"]
+            result["input_perturbation_std_end"] = ip.get("std_end")
+            result["input_perturbation_schedule"] = ip.get("schedule", "linear")
+        return result
 
     @classmethod
     def register_net_initializer(cls, name, constructor, overwrite: bool = False):
@@ -299,8 +333,25 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         # Resolves https://github.com/sdatkinson/neural-amp-modeler/issues/351
         checkpoint["sample_rate"] = self.net.sample_rate
 
+    def on_train_epoch_start(self):
+        if self._input_perturbation_std is None or self._input_perturbation_std <= 0:
+            return
+        std = self._effective_input_perturbation_std()
+        self.log("input_perturbation_std", std, on_step=False, on_epoch=True)
+
+    def _effective_input_perturbation_std(self) -> float:
+        if self._input_perturbation_std is None:
+            return 0.0
+        return _input_perturbation_std_at_epoch(
+            self._input_perturbation_std,
+            self._input_perturbation_std_end,
+            self._input_perturbation_schedule,
+            self.current_epoch,
+            self.trainer.max_epochs if self.trainer else 1,
+        )
+
     def _shared_step(
-        self, batch
+        self, batch, *, add_input_perturbation: bool = False
     ) -> _Tuple[_torch.Tensor, _torch.Tensor, _Dict[str, _LossItem]]:
         """
         B: Batch size
@@ -309,17 +360,34 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         :return: (B,L), (B,L)
         """
         args, targets = batch[:-1], batch[-1]
+        if add_input_perturbation and len(args) > 0:
+            perturb_std = self._effective_input_perturbation_std()
+            if perturb_std > 0.0:
+                x = args[0]
+                x = x + _torch.randn_like(x) * perturb_std
+                args = (x,) + tuple(args[1:])
         preds = self(*args, pad_start=False)
 
         return preds, targets, self._get_loss_dict(preds, targets)
 
     def training_step(self, batch, batch_idx):
-        _, _, loss_dict = self._shared_step(batch)
+        _, _, loss_dict = self._shared_step(
+            batch, add_input_perturbation=True
+        )
 
         loss = 0.0
         for v in loss_dict.values():
             if v.weight is not None and v.weight > 0.0:
                 loss = loss + v.weight * v.value
+
+        log_data = {}
+        for name, param in self.named_parameters():
+            if "head_skip_gates" in name:
+                tag = name.replace(".", "/")
+                log_data[tag] = param.item()
+        if log_data:
+            self.log_dict(log_data)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
