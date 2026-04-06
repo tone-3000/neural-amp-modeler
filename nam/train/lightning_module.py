@@ -320,6 +320,15 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         for v in loss_dict.values():
             if v.weight is not None and v.weight > 0.0:
                 loss = loss + v.weight * v.value
+
+        log_data = {}
+        for name, param in self.named_parameters():
+            if "head_skip_gates" in name:
+                tag = name.replace(".", "/")
+                log_data[tag] = param.item()
+        if log_data:
+            self.log_dict(log_data)
+
         return loss
 
     def validation_step(self, batch, batch_idx):

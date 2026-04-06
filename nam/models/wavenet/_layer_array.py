@@ -654,6 +654,12 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
             return {"method": _SLIMMABLE_METHOD, "kwargs": kwargs}
 
 
+def _zero_init_1x1(channels: int) -> _nn.Conv1d:
+    conv = _nn.Conv1d(channels, channels, 1, bias=False)
+    _nn.init.zeros_(conv.weight)
+    return conv
+
+
 class LayerArray(_nn.Module, _InitializableFromConfig):
     """
     Takes in the input and condition (and maybe the head input so far); outputs the
@@ -669,12 +675,25 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         rechannel: _conv.RechannelIn,
         layers: _nn.ModuleList,
         head_rechannel: _conv.HeadRechannel,
+        head_skip_indices: _Optional[_Sequence[int]] = None,
+        head_skip_mode: str = "disconnected",
+        head_skip_alphas: _Optional[_Dict[str, float]] = None,
+        head_skip_gates: _Optional[_nn.ParameterDict] = None,
+        head_skip_projections: _Optional[_nn.ModuleDict] = None,
     ):
         super().__init__()
 
         self._rechannel = rechannel
         self._layers = layers
         self._head_rechannel = head_rechannel
+
+        self._head_skip_indices: frozenset[int] = (
+            frozenset(head_skip_indices) if head_skip_indices else frozenset()
+        )
+        self._head_skip_mode = head_skip_mode
+        self._head_skip_alphas = head_skip_alphas or {}
+        self._head_skip_gates = head_skip_gates or _nn.ParameterDict()
+        self._head_skip_projections = head_skip_projections or _nn.ModuleDict()
 
     @classmethod
     def parse_config(cls, config: _Dict) -> _Dict:
@@ -773,10 +792,59 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
             head_rechannel_in_channels, head_size, 1, bias=head_bias, is_last=is_last
         )
 
+        head_skip_config = config.pop("head_skip", None)
+        head_skip_indices = None
+        head_skip_mode = "disconnected"
+        head_skip_alphas = None
+        head_skip_gates = None
+        head_skip_projections = None
+
+        if head_skip_config is not None:
+            if not isinstance(head_skip_config, dict):
+                raise ValueError(
+                    f"head_skip must be a dict with 'indices' and 'mode', "
+                    f"got {type(head_skip_config)}"
+                )
+            head_skip_indices = head_skip_config.get("indices")
+            head_skip_mode = head_skip_config.get("mode", "disconnected")
+            head_skip_alphas_list = head_skip_config.get("alphas")
+
+            if head_skip_indices is not None:
+                if head_skip_mode == "fixed":
+                    if head_skip_alphas_list is None or len(head_skip_alphas_list) != len(
+                        head_skip_indices
+                    ):
+                        raise ValueError(
+                            "fixed mode requires 'alphas' list matching 'indices' length"
+                        )
+                    head_skip_alphas = {
+                        str(i): a
+                        for i, a in zip(head_skip_indices, head_skip_alphas_list)
+                    }
+                elif head_skip_mode == "scalar":
+                    head_skip_gates = _nn.ParameterDict(
+                        {
+                            str(i): _nn.Parameter(_torch.zeros(1))
+                            for i in head_skip_indices
+                        }
+                    )
+                elif head_skip_mode == "learned":
+                    head_skip_projections = _nn.ModuleDict(
+                        {
+                            str(i): _zero_init_1x1(head_rechannel_in_channels)
+                            for i in head_skip_indices
+                        }
+                    )
+
         return dict(
             rechannel=rechannel,
             layers=layers,
             head_rechannel=head_rechannel,
+            head_skip_indices=head_skip_indices,
+            head_skip_mode=head_skip_mode,
+            head_skip_alphas=head_skip_alphas,
+            head_skip_gates=head_skip_gates,
+            head_skip_projections=head_skip_projections,
         )
 
     @property
@@ -846,6 +914,21 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
             "secondary_activation": secondary_activations,
             "slimmable": first_layer.get_slimmable_config(),
         }
+
+        if self._head_skip_indices:
+            indices = sorted(self._head_skip_indices)
+            hs: _Dict[str, _Any] = {
+                "indices": indices,
+                "mode": self._head_skip_mode,
+            }
+            if self._head_skip_mode == "fixed":
+                hs["alphas"] = [self._head_skip_alphas[str(i)] for i in indices]
+            elif self._head_skip_mode == "scalar":
+                hs["alphas"] = [
+                    self._head_skip_gates[str(i)].item() for i in indices
+                ]
+            config["head_skip"] = hs
+
         return config
 
     def export_weights(self) -> _torch.Tensor:
@@ -884,8 +967,17 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         """
         out_length = min(x.shape[2], c.shape[2]) - (self.receptive_field - 1)
         x = self._rechannel(x)
-        for layer in self._layers:
-            x, head_term = layer(x, c, out_length)  # Ensures head_term sample length
+        for i, layer in enumerate(self._layers):
+            x, head_term = layer(x, c, out_length)
+            if i in self._head_skip_indices:
+                if self._head_skip_mode == "learned":
+                    head_term = self._head_skip_projections[str(i)](head_term)
+                elif self._head_skip_mode == "scalar":
+                    head_term = self._head_skip_gates[str(i)] * head_term
+                elif self._head_skip_mode == "fixed":
+                    head_term = self._head_skip_alphas[str(i)] * head_term
+                else:  # disconnected
+                    continue
             head_input = (
                 head_term
                 if head_input is None
